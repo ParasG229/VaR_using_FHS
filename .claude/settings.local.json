@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(jupyter kernelspec *)",
+      "Bash(python -c ' *)",
+      "Bash(cd \"/d/Documents \\(Drive\\)/Projects/Quant Projects/VaR using MCS\" && rm -f scratch_check.png)"
+    ]
+  }
+}

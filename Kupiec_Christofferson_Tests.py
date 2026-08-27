@@ -26,9 +26,24 @@ model is slow to react to changing volatility).
 
 Reference: Kupiec (1995); Christoffersen (1998).
 
-Input: single_stock_var_es_rolling.csv, produced by Single_Stock_VaR_Model.py
-(columns: Date, realized_return, VaR_<confidence>, ...).
+Input: a walk-forward VaR backtest CSV indexed by Date, with a realized-outcome
+column and one or more VaR columns. Two producers are supported:
+
+    single_stock_var_es_rolling.csv (Single_Stock_VaR_Model.py)
+        columns: Date, realized_return, VaR_<confidence>, ...
+        (VaR is in return units)
+
+    dcc_garch_portfolio_var_es.csv (DCC_GARCH.py)
+        columns: Date, realized_pnl_1d, VaR_<horizon>d_<confidence>, ...
+        (VaR is in dollar P&L units)
+
+Only 1-day-horizon VaR columns are testable here: the LR tests below assume
+an iid daily breach sequence, and a multi-day VaR's realized outcome would
+need overlapping windows, which manufactures spurious clustering regardless
+of model quality. Any non-1-day VaR column found in the input is skipped.
 """
+
+import re
 
 import numpy as np
 import pandas as pd
@@ -38,18 +53,41 @@ from scipy.stats import chi2
 # Config
 # ---------------------------------------------------------------------------
 ROLLING_CSV = "single_stock_var_es_rolling.csv"
-TICKER = "AAPL"
+OUTPUT_CSV = "var_backtest_kupiec_christoffersen.csv"  # change alongside ROLLING_CSV to avoid overwriting other backtests
+LABEL = "AAPL"  # display label only (a ticker for single-stock, a portfolio name otherwise)
 SIGNIFICANCE = 0.05  # reject H0 (model misspecified) if p-value < this
+
+# First of these found in the data is used as the realized 1-day outcome.
+REALIZED_COL_CANDIDATES = ["realized_return", "realized_pnl_1d", "realized_pnl"]
 
 # ---------------------------------------------------------------------------
 # Load walk-forward VaR backtest data
 # ---------------------------------------------------------------------------
 data = pd.read_csv(ROLLING_CSV, index_col="Date", parse_dates=True)
 
-var_cols = [c for c in data.columns if c.startswith("VaR_") and not c.endswith("_$")]
-if not var_cols:
-    raise ValueError(f"No VaR_<confidence> columns found in {ROLLING_CSV}.")
-confidence_levels = sorted(float(c.split("_", 1)[1]) for c in var_cols)
+VAR_COL_RE = re.compile(r"^VaR_(?:(\d+)d_)?([0-9.]+)$")  # VaR_0.99  or  VaR_10d_0.99
+
+var_cols_1d = {}  # confidence -> column name
+for c in data.columns:
+    m = VAR_COL_RE.match(c)
+    if not m:
+        continue
+    horizon = int(m.group(1)) if m.group(1) else 1
+    confidence = float(m.group(2))
+    if horizon != 1:
+        print(f"Skipping {c}: {horizon}-day horizon isn't testable with this iid breach framework "
+              f"(see module docstring).")
+        continue
+    var_cols_1d[confidence] = c
+
+if not var_cols_1d:
+    raise ValueError(f"No 1-day VaR_<confidence> columns found in {ROLLING_CSV}.")
+
+realized_col = next((c for c in REALIZED_COL_CANDIDATES if c in data.columns), None)
+if realized_col is None:
+    raise ValueError(f"No realized-outcome column found in {ROLLING_CSV} (looked for {REALIZED_COL_CANDIDATES}).")
+
+confidence_levels = sorted(var_cols_1d)
 
 
 def kupiec_pof_test(breaches, confidence):
@@ -102,13 +140,14 @@ def christoffersen_independence_test(breaches):
 # ---------------------------------------------------------------------------
 # Run tests per confidence level
 # ---------------------------------------------------------------------------
-print(f"{TICKER} - VaR backtest: Kupiec & Christoffersen tests")
-print(f"{len(data)} out-of-sample days  |  significance level: {SIGNIFICANCE:.0%}\n")
+print(f"{LABEL} - VaR backtest: Kupiec & Christoffersen tests")
+print(f"Realized outcome column: {realized_col}  |  {len(data)} out-of-sample days  |  "
+      f"significance level: {SIGNIFICANCE:.0%}\n")
 
 results = []
 for cl in confidence_levels:
-    var_col = f"VaR_{cl}"
-    breaches = (data["realized_return"] < -data[var_col]).to_numpy().astype(int)
+    var_col = var_cols_1d[cl]
+    breaches = (data[realized_col] < -data[var_col]).to_numpy().astype(int)
 
     lr_uc, p_uc, breach_rate = kupiec_pof_test(breaches, cl)
     lr_ind, p_ind = christoffersen_independence_test(breaches)
@@ -147,4 +186,4 @@ for cl in confidence_levels:
     print()
 
 results_df = pd.DataFrame(results).set_index("confidence")
-results_df.to_csv("var_backtest_kupiec_christoffersen.csv")
+results_df.to_csv(OUTPUT_CSV)

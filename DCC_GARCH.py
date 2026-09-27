@@ -12,8 +12,13 @@ extended to multiple correlated assets):
         from data up to t-1), so it carries no look-ahead bias.
 
     Stage 2 - Dynamic correlation (DCC(1,1), Engle 2002)
-        On the same trailing 504-day window of the z_{i,t} matrix, estimate
-        scalar DCC parameters (a, b) by QMLE, refit every day:
+        On a trailing 504-day window of the z_{i,t} matrix -- itself only
+        available from day 504 of the *out-of-sample* Stage 1 output, so
+        this stage's first estimate needs roughly 2*TRAIN_WINDOW (~1008,
+        ~4 years) trading days of underlying return history in total, not
+        just TRAIN_WINDOW. main() raises a clear error if there isn't
+        enough history rather than silently producing zero output rows.
+        Estimate scalar DCC parameters (a, b) by QMLE, refit every day:
             Q_t = (1-a-b) Qbar + a z_{t-1} z_{t-1}' + b Q_{t-1}
             R_t = diag(Q_t)^{-1/2} Q_t diag(Q_t)^{-1/2}
         Qbar = sample covariance of z over the window. Forecast R_{t+1} is
@@ -40,23 +45,45 @@ extended to multiple correlated assets):
 
     Stage 4 - Portfolio valuation
         Stock legs: linear P&L (qty * price change).
-        Option legs: full Black-Scholes repricing on each simulated
-        underlying path, holding implied vol at each contract's latest
-        observed value ("sticky IV"), discounting with the supplied
+
+        Option legs (OPTION_ROLL only): a rolled constant-maturity synthetic
+        option (e.g. "always the ~30-day ATM call"), described by
+        TargetTenorDays/TargetMoneyness instead of a fixed contract.
+        Reconstructed each day from the implied-vol surface in
+        vol_surface.csv (fixed tenor/moneyness nodes -- e.g. a vendor's own
+        vol surface rather than raw per-contract quotes) by interpolating
+        implied vol at the target tenor/moneyness: linear across moneyness
+        within each surface tenor node, then linear in total variance across
+        the two bracketing tenor nodes (see surface_iv()) -- has data across
+        the full backtest window as long as the surface does, since it isn't
+        tied to one contract's finite life. Repriced via full Black-Scholes
+        on each simulated underlying path, discounting with the supplied
         risk-free curve. No dividend yield curve in the input format (see
         DIVIDEND_YIELD below) -- flat assumption, refine later if needed.
 
         The current positions.csv snapshot is treated as a constant
         hypothetical portfolio walked backward through history (the
-        standard way to backtest a snapshot portfolio's VaR model) -- dates
-        after an option's expiry are skipped for that leg.
+        standard way to backtest a snapshot portfolio's VaR model).  Legs
+        that can't be priced on a given day (surface doesn't bracket the
+        target tenor) are excluded from that day's P&L and recorded in the
+        excluded_legs output column -- not silently dropped.
 
 Raw data format (see Data/Templates/*.csv for examples):
     stock_prices.csv   : Date, Ticker, AdjClose
-    option_prices.csv  : Date, OptionID, UnderlyingTicker, Type, Strike, Expiry, Price, ImpliedVol
-    positions.csv      : InstrumentID, InstrumentType, Ticker, Quantity, Strike, Expiry, OptionType
-    risk_free_rate.csv : Date, Rate
+    vol_surface.csv     : Date, UnderlyingTicker, TenorDays, Moneyness, ImpliedVol
+                          (a fixed tenor/moneyness implied-vol surface -- e.g. a vendor's own
+                          vol surface rather than raw per-contract quotes; Moneyness is
+                          Strike/Spot - 1, so 0.0 = ATM, -0.10/+0.10 = 10% below/above spot)
+    positions.csv       : InstrumentID, InstrumentType, Ticker, Quantity,
+                           OptionType, TargetTenorDays, TargetMoneyness    (OPTION_ROLL rows)
+    risk_free_rate.csv : Date, TenorDays, Rate
+                          (a zero-rate curve -- multiple tenor nodes per date, e.g. O/N
+                          through 1Y SOFR OIS or Treasury CMT. Each option leg is discounted
+                          at the rate interpolated to *its own* time-to-expiry rather than one
+                          flat rate for the whole portfolio -- see risk_free_rate())
 """
+
+import bisect
 
 import numpy as np
 import pandas as pd
@@ -67,15 +94,15 @@ from arch import arch_model
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DATA_DIR = "Data/Templates"
+DATA_DIR = "Data/Processed"
 STOCK_PRICES_CSV = f"{DATA_DIR}/stock_prices.csv"
-OPTION_PRICES_CSV = f"{DATA_DIR}/option_prices.csv"
+VOL_SURFACE_CSV = f"{DATA_DIR}/vol_surface.csv"
 POSITIONS_CSV = f"{DATA_DIR}/positions.csv"
 RISK_FREE_CSV = f"{DATA_DIR}/risk_free_rate.csv"
 
 START_DATE = None  # None -> use all available history; set e.g. "2022-01-01" for a faster test run
 
-TRAIN_WINDOW = 504  # trading days (~2 years)
+TRAIN_WINDOW = 252  # trading days (~2 years)
 RECAL_STEP = 1  # recalibrate every day (both EGARCH and DCC)
 
 MEAN_MODEL = "Constant"
@@ -87,7 +114,7 @@ DCC_INIT = (0.03, 0.90)
 
 CONFIDENCE_LEVELS = [0.99]
 HORIZONS_DAYS = [1, 10]
-N_SIMULATIONS = 5000
+N_SIMULATIONS = 10000
 RANDOM_SEED = 42
 
 DIVIDEND_YIELD = 0.0  # flat assumption; input format has no per-ticker dividend curve
@@ -106,22 +133,63 @@ def load_stock_prices(path):
     return wide
 
 
-def load_option_prices(path):
-    df = pd.read_csv(path, parse_dates=["Date", "Expiry"])
-    df["Type"] = df["Type"].str.upper().str[0]  # normalize "Call"/"C"/"call" -> "C"
+def load_vol_surface(path):
+    df = pd.read_csv(path, parse_dates=["Date"])
+    df["UnderlyingTicker"] = df["UnderlyingTicker"].str.upper()
+    df["TenorDays"] = pd.to_numeric(df["TenorDays"])
+    df["Moneyness"] = pd.to_numeric(df["Moneyness"])
     return df
 
 
 def load_positions(path):
-    df = pd.read_csv(path, parse_dates=["Expiry"])
+    df = pd.read_csv(path)
     df["InstrumentType"] = df["InstrumentType"].str.upper()
     df["OptionType"] = df["OptionType"].astype(str).str.upper().str[0]
+    df["TargetTenorDays"] = pd.to_numeric(df["TargetTenorDays"], errors="coerce")
+    df["TargetMoneyness"] = pd.to_numeric(df["TargetMoneyness"], errors="coerce")
     return df
 
 
-def load_risk_free(path, index):
-    df = pd.read_csv(path, parse_dates=["Date"]).set_index("Date").sort_index()
-    return df["Rate"].reindex(index).ffill().bfill()
+def load_risk_free_curve(path):
+    """Zero-rate curve, multiple tenor nodes per date (see module docstring). Returns
+    (curve_by_date, available_dates) for risk_free_rate() -- available_dates is sorted so
+    that function can do a sticky "latest curve on or before as_of_date" lookup."""
+    df = pd.read_csv(path, parse_dates=["Date"]).sort_values(["Date", "TenorDays"])
+    curve_by_date = {
+        date: (grp["TenorDays"].to_numpy(dtype=float), grp["Rate"].to_numpy(dtype=float))
+        for date, grp in df.groupby("Date")
+    }
+    available_dates = sorted(curve_by_date.keys())
+    return curve_by_date, available_dates
+
+
+def risk_free_rate(rf_curve, as_of_date, tenor_days):
+    """Zero rate for `tenor_days` maturity from the risk-free curve as of as_of_date --
+    each option leg is discounted at the rate matched to *its own* time-to-expiry rather
+    than one flat rate for the whole portfolio (see module docstring). Sticky: uses the
+    latest published curve on or before as_of_date. Interpolated linearly in the
+    compounding exponent (rate * tenor_days) between the two bracketing curve tenors --
+    the same total-variance-style approach as surface_iv()'s tenor interpolation -- and
+    flat-extrapolated beyond the curve's own tenor range (short-rate curves aren't
+    reliably extrapolated in log space the way an implied-vol surface is)."""
+    curve_by_date, available_dates = rf_curve
+    pos = bisect.bisect_right(available_dates, as_of_date) - 1
+    if pos < 0:
+        raise ValueError(f"No risk-free curve available on or before {as_of_date.date()}")
+    tenors, rates = curve_by_date[available_dates[pos]]
+
+    tenor_days = max(tenor_days, 1e-6)
+    if tenor_days <= tenors[0]:
+        return float(rates[0])
+    if tenor_days >= tenors[-1]:
+        return float(rates[-1])
+
+    total = rates * tenors
+    idx = np.searchsorted(tenors, tenor_days) - 1
+    t0, t1 = tenors[idx], tenors[idx + 1]
+    v0, v1 = total[idx], total[idx + 1]
+    w = (tenor_days - t0) / (t1 - t0)
+    return float((v0 + w * (v1 - v0)) / tenor_days)
 
 
 def compute_log_returns(prices_wide):
@@ -252,7 +320,7 @@ def simulate_returns(pool, sigma_next, R_forecast, horizon_days, n_sims=N_SIMULA
 
     total_log_return = np.zeros((n_sims, n))
     max_start = T_pool - horizon_days
-    for _ in range(horizon_days):
+    for _ in range(horizon_days): 
         idx = rng.integers(0, max(max_start, 1), size=n_sims)
         e = pool[idx]  # (n_sims, n)
         z_sim = e @ L_forecast.T
@@ -279,47 +347,120 @@ def bs_price(S, K, T, r, sigma, option_type, q=DIVIDEND_YIELD):
 # ---------------------------------------------------------------------------
 # Portfolio P&L from simulated underlying returns
 # ---------------------------------------------------------------------------
-def latest_iv(option_prices, option_id, as_of_date):
-    hist = option_prices[(option_prices["OptionID"] == option_id) & (option_prices["Date"] <= as_of_date)]
-    if hist.empty:
-        return None
-    return hist.sort_values("Date")["ImpliedVol"].iloc[-1]
+def surface_iv(vol_surface, underlying, as_of_date, target_tenor_days, target_moneyness):
+    """Interpolate an implied vol at (target_tenor_days, target_moneyness) from a fixed
+    tenor/moneyness vol surface (vol_surface.csv) quoted on as_of_date, for a rolled
+    constant-maturity synthetic option position.
+
+    Method: within each surface tenor node present that day, interpolate IV across
+    moneyness linearly to get that node's IV at target_moneyness; then interpolate across
+    the two bracketing tenor nodes linearly in total variance (IV^2 * tenor_days) -- the
+    same approach the CBOE uses to blend near/far contracts into a constant-maturity level.
+    Unlike a raw per-contract chain, the surface is already expressed in moneyness terms
+    and isn't split by option type (put/call implied vol at a given strike is identical
+    under Black-Scholes), so no spot or option-type argument is needed here.
+
+    Returns (iv, note): note is None on a clean two-sided bracket, or a short string flagging
+    a fallback (single tenor node, or target tenor outside the available nodes) so the caller
+    can still price the leg but surface the caveat rather than silently absorbing it.
+    """
+    day_surf = vol_surface[
+        (vol_surface["UnderlyingTicker"] == underlying) & (vol_surface["Date"] == as_of_date)
+    ]
+    if day_surf.empty:
+        return None, "no surface quotes for this date"
+
+    tenor_points = []
+    for tenor, grp in day_surf.groupby("TenorDays"):
+        grp = grp.sort_values("Moneyness")
+        if grp["Moneyness"].nunique() >= 2:
+            iv_at_target = np.interp(target_moneyness, grp["Moneyness"], grp["ImpliedVol"])
+        else:
+            iv_at_target = grp["ImpliedVol"].iloc[(grp["Moneyness"] - target_moneyness).abs().argmin()]
+        tenor_points.append((tenor, iv_at_target))
+
+    tenor_points.sort()
+    tenors = np.array([t for t, _ in tenor_points], dtype=float)
+    ivs = np.array([iv for _, iv in tenor_points])
+
+    if len(tenor_points) == 1:
+        return float(ivs[0]), "only one tenor node available -- no tenor interpolation"
+
+    total_var = ivs ** 2 * tenors
+    if target_tenor_days in tenors:
+        return float(ivs[tenors == target_tenor_days][0]), None
+    elif target_tenor_days < tenors[0]:
+        note, idx = "target tenor before nearest available surface node -- extrapolated", 0
+    elif target_tenor_days > tenors[-1]:
+        note, idx = "target tenor beyond farthest available surface node -- extrapolated", len(tenors) - 2
+    else:
+        note, idx = None, np.searchsorted(tenors, target_tenor_days) - 1
+
+    t0, t1 = tenors[idx], tenors[idx + 1]
+    v0, v1 = total_var[idx], total_var[idx + 1]
+    w = (target_tenor_days - t0) / (t1 - t0)
+    var_target = v0 + w * (v1 - v0)
+    iv_target = np.sqrt(max(var_target, 1e-8) / target_tenor_days)
+    return float(iv_target), note
 
 
-def portfolio_pnl(sim_log_returns, tickers, spot_today, positions, option_prices, as_of_date, horizon_days, r):
-    """sim_log_returns: (n_sims, n) aligned to `tickers`. Returns array of portfolio P&L per sim."""
+def portfolio_pnl(sim_log_returns, tickers, spot_today, positions, vol_surface, as_of_date, horizon_days, rf_curve):
+    """sim_log_returns: (n_sims, n) aligned to `tickers`. Returns (pnl, excluded) where
+    excluded is a list of (InstrumentID, reason) for legs dropped from this day's portfolio
+    -- e.g. an option contract that hadn't started trading yet this far back in the backtest,
+    or had already expired. Dropped legs are surfaced, not silently absorbed, so the reported
+    VaR/ES for a given day is clearly labeled as to which legs it actually reflects.
+
+    Each option leg is discounted at the risk-free rate for *its own* time-to-expiry
+    (via risk_free_rate()), not one flat portfolio-wide rate -- see module docstring.
+    """
     sim_prices = spot_today.values * np.exp(sim_log_returns)  # (n_sims, n)
     ticker_idx = {t: i for i, t in enumerate(tickers)}
     pnl = np.zeros(sim_log_returns.shape[0])
+    excluded = []
 
     for _, pos in positions.iterrows():
         if pos["InstrumentType"] == "STOCK":
             if pos["Ticker"] not in ticker_idx:
+                excluded.append((pos["InstrumentID"], "ticker not in return series"))
                 continue
             i = ticker_idx[pos["Ticker"]]
             s0 = spot_today[pos["Ticker"]]
             pnl += pos["Quantity"] * (sim_prices[:, i] - s0)
 
-        elif pos["InstrumentType"] == "OPTION":
+        elif pos["InstrumentType"] == "OPTION_ROLL":
+            # Rolled constant-maturity synthetic option (e.g. "always the ~30-day ATM
+            # call"), reconstructed from the implied-vol surface each day rather than
+            # tracking one decaying contract -- see surface_iv(). Tenor is held constant
+            # across the simulation horizon (it's rebalanced back to target daily, not
+            # decaying) and the strike is rebalanced to spot*(1+target_moneyness) on each
+            # simulated path, tracking constant relative moneyness the same way the "today"
+            # leg does. Constant tenor -> same discount rate for both legs.
             if pos["Ticker"] not in ticker_idx:
+                excluded.append((pos["InstrumentID"], "underlying ticker not in return series"))
                 continue
-            expiry = pos["Expiry"]
-            t_today = (expiry - as_of_date).days / 365.0
-            t_horizon = (expiry - (as_of_date + pd.Timedelta(days=horizon_days))).days / 365.0
-            if t_today <= 0:
-                continue  # expired as of this backtest date -- excluded from that day's portfolio
-
-            iv = latest_iv(option_prices, pos["InstrumentID"], as_of_date)
-            if iv is None or not np.isfinite(iv):
-                continue
-
             i = ticker_idx[pos["Ticker"]]
             s0 = spot_today[pos["Ticker"]]
-            price_today = bs_price(s0, pos["Strike"], t_today, r, iv, pos["OptionType"])
-            price_sim = bs_price(sim_prices[:, i], pos["Strike"], t_horizon, r, iv, pos["OptionType"])
+            target_tenor = pos["TargetTenorDays"]
+            target_moneyness = pos["TargetMoneyness"]
+
+            iv, note = surface_iv(vol_surface, pos["Ticker"], as_of_date, target_tenor, target_moneyness)
+            if iv is None:
+                excluded.append((pos["InstrumentID"], note))
+                continue
+            if note:
+                excluded.append((pos["InstrumentID"], f"included with caveat: {note}"))
+
+            t_target = target_tenor / 365.0
+            r_target = risk_free_rate(rf_curve, as_of_date, target_tenor)
+            strike_today = s0 * (1 + target_moneyness)
+            price_today = bs_price(s0, strike_today, t_target, r_target, iv, pos["OptionType"])
+
+            strike_sim = sim_prices[:, i] * (1 + target_moneyness)
+            price_sim = bs_price(sim_prices[:, i], strike_sim, t_target, r_target, iv, pos["OptionType"])
             pnl += pos["Quantity"] * (price_sim - price_today)
 
-    return pnl
+    return pnl, excluded
 
 
 def var_es(pnl, confidence):
@@ -335,10 +476,10 @@ def var_es(pnl, confidence):
 # ---------------------------------------------------------------------------
 def main():
     stock_prices = load_stock_prices(STOCK_PRICES_CSV)
-    option_prices = load_option_prices(OPTION_PRICES_CSV)
+    vol_surface = load_vol_surface(VOL_SURFACE_CSV)
     positions = load_positions(POSITIONS_CSV)
     log_ret = compute_log_returns(stock_prices)
-    risk_free = load_risk_free(RISK_FREE_CSV, log_ret.index)
+    rf_curve = load_risk_free_curve(RISK_FREE_CSV)
 
     print(f"Assets: {list(log_ret.columns)}  |  {len(log_ret)} return observations")
 
@@ -348,6 +489,19 @@ def main():
 
     tickers = list(z.columns)
     n_obs = len(z)
+
+    # z already burned TRAIN_WINDOW days of returns for the EGARCH stage (Stage 1);
+    # the DCC stage (Stage 2) then needs its own trailing TRAIN_WINDOW window of z,
+    # so the model needs roughly 2*TRAIN_WINDOW trading days of return history in
+    # total before it can produce a single output row.
+    if n_obs <= TRAIN_WINDOW:
+        raise ValueError(
+            f"Only {n_obs} days of out-of-sample vol/z forecasts available, but "
+            f"TRAIN_WINDOW={TRAIN_WINDOW} days are needed for the DCC stage on top "
+            f"of that -- need roughly 2*TRAIN_WINDOW ({2 * TRAIN_WINDOW}) trading "
+            f"days of return history in total (~{2 * TRAIN_WINDOW / TRADING_DAYS_PER_YEAR:.1f} "
+            f"years). Provide more history, an earlier START_DATE, or a smaller TRAIN_WINDOW."
+        )
 
     records = []
     a_prev, b_prev = DCC_INIT
@@ -363,12 +517,13 @@ def main():
         pool = build_innovation_pool(z_window, R_series)
         sigma_next = vol_forecast.loc[forecast_date, tickers].to_numpy()
         spot_today = stock_prices.loc[as_of_date, tickers]
-        r = risk_free.loc[as_of_date]
 
         row = {"Date": forecast_date, "dcc_a": a, "dcc_b": b}
+        excluded_all = []
         for h in HORIZONS_DAYS:
             sim_returns = simulate_returns(pool, sigma_next, R_forecast, h)
-            pnl = portfolio_pnl(sim_returns, tickers, spot_today, positions, option_prices, as_of_date, h, r)
+            pnl, excluded = portfolio_pnl(sim_returns, tickers, spot_today, positions, vol_surface, as_of_date, h, rf_curve)
+            excluded_all.extend(excluded)  # same exclusion set each horizon (expiry/IV checks don't depend on h)
             for cl in CONFIDENCE_LEVELS:
                 var_loss, es_loss = var_es(pnl, cl)
                 row[f"VaR_{h}d_{cl}"] = var_loss
@@ -380,10 +535,13 @@ def main():
         # 10-day VaR uses overlapping windows, which violates the iid breach
         # assumption those tests rely on.
         realized_return = log_ret.loc[forecast_date, tickers].to_numpy().reshape(1, -1)
-        realized_pnl = portfolio_pnl(
-            realized_return, tickers, spot_today, positions, option_prices, as_of_date, 1, r
-        )[0]
-        row["realized_pnl_1d"] = realized_pnl
+        realized_pnl_arr, _ = portfolio_pnl(
+            realized_return, tickers, spot_today, positions, vol_surface, as_of_date, 1, rf_curve
+        )
+        row["realized_pnl_1d"] = realized_pnl_arr[0]
+
+        excluded_unique = sorted(set(excluded_all))
+        row["excluded_legs"] = "; ".join(f"{inst_id} ({reason})" for inst_id, reason in excluded_unique)
 
         records.append(row)
 

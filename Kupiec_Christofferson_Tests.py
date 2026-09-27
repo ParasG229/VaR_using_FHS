@@ -52,9 +52,9 @@ from scipy.stats import chi2
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ROLLING_CSV = "single_stock_var_es_rolling.csv"
-OUTPUT_CSV = "var_backtest_kupiec_christoffersen.csv"  # change alongside ROLLING_CSV to avoid overwriting other backtests
-LABEL = "AAPL"  # display label only (a ticker for single-stock, a portfolio name otherwise)
+ROLLING_CSV = "dcc_garch_portfolio_var_es.csv"
+OUTPUT_CSV = "dcc_garch_kupiec_christoffersen.csv"  # change alongside ROLLING_CSV to avoid overwriting other backtests
+LABEL = "Portfolio (DCC-GARCH)"  # display label only (a ticker for single-stock, a portfolio name otherwise)
 SIGNIFICANCE = 0.05  # reject H0 (model misspecified) if p-value < this
 
 # First of these found in the data is used as the realized 1-day outcome.
